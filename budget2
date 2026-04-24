@@ -1,0 +1,168 @@
+CREATE DATABASE BudgetDB;
+GO
+USE BudgetDB;
+GO
+
+-- Groups Table
+CREATE TABLE Groups(
+    GroupPK INT IDENTITY(1,1) PRIMARY KEY,
+    GroupName NVARCHAR(200) NOT NULL UNIQUE,
+    CreatedDate DATETIME2 NOT NULL DEFAULT SYSUTCDATETIME(),
+    IsActive BIT NOT NULL DEFAULT 1
+);
+
+-- Users Table
+CREATE TABLE Users(
+    UserPK INT IDENTITY(1,1) PRIMARY KEY,
+    Username NVARCHAR(150) NOT NULL UNIQUE,
+    PasswordHash NVARCHAR(256) NOT NULL,
+    FullName NVARCHAR(200) NOT NULL,
+    Title NVARCHAR(200) NOT NULL,
+    Email NVARCHAR(200) NOT NULL,
+    CreatedDate DATETIME2 NOT NULL DEFAULT SYSUTCDATETIME(),
+    IsActive BIT NOT NULL DEFAULT 1
+);
+
+-- User to Group Membership Table (This table provides RLS)
+CREATE TABLE UserGroupMapping(
+    UserFK INT NOT NULL,
+    GroupFK INT NOT NULL,
+    PRIMARY KEY (UserFK, GroupFK),
+    CONSTRAINT FK_UserGroups_Users FOREIGN KEY (UserFK) REFERENCES Users(UserPK),
+    CONSTRAINT FK_UserGroups_Groups FOREIGN KEY (GroupFK) REFERENCES Groups(GroupPK)
+);
+
+-- Cost Center Table
+CREATE TABLE CostCenters(
+    PK INT IDENTITY(1,1) PRIMARY KEY,
+    CostCenterName NVARCHAR(200) NOT NULL,
+    CostCenterCode NVARCHAR(50) NOT NULL UNIQUE,
+    InfinityID NVARCHAR(200) NULL UNIQUE,
+    CreatedDate DATETIME2 NOT NULL DEFAULT SYSUTCDATETIME()
+);
+
+-- Projects Table
+CREATE TABLE Projects(
+    PK INT IDENTITY(1,1) PRIMARY KEY,
+    ProjectID NVARCHAR(50) NOT NULL UNIQUE,
+    ProjectName NVARCHAR(200) NOT NULL,
+    StartDate DATETIME2 NOT NULL,
+    EndDate DATETIME2 NOT NULL,
+    InfinityID NVARCHAR(200) NULL UNIQUE,
+    CreatedDate DATETIME2 NOT NULL DEFAULT SYSUTCDATETIME()
+);
+
+-- Create Table for Budgets (Supports Hierarchical, Audited, RLS-Enabled)
+CREATE TABLE Budgets(
+    BudgetPK INT IDENTITY(1,1) PRIMARY KEY,
+    ParentBudgetPK INT NULL,
+    CostCenterFK INT NOT NULL,
+    ProjectFK INT NOT NULL,
+    BudgetName NVARCHAR(200) NOT NULL,
+    BudgetType NVARCHAR(100) NOT NULL DEFAULT 'Budget',
+    BilledCost DECIMAL(18,2) NOT NULL,
+    EffectiveCost DECIMAL(18,2) NOT NULL,
+    StartDate DATE NOT NULL,
+    EndDate DATE NOT NULL,
+    CreatedByFK INT NOT NULL DEFAULT 1,
+    CreatedDate DATETIME2 NOT NULL DEFAULT SYSUTCDATETIME(),
+    UpdatedByFK INT NULL,
+    UpdatedDate DATETIME2 NULL,
+    CONSTRAINT FK_Budgets_CostCenter FOREIGN KEY (CostCenterFK) REFERENCES CostCenters(PK),
+    CONSTRAINT FK_Budgets_Project FOREIGN KEY (ProjectFK) REFERENCES Projects(PK),
+    CONSTRAINT FK_Budgets_Parent FOREIGN KEY (ParentBudgetPK) REFERENCES Budgets(BudgetPK),
+    CONSTRAINT CK_Budgets_DateRange CHECK (StartDate <= EndDate),
+    CONSTRAINT FK_Budgets_CreatedBy FOREIGN KEY (CreatedByFK) REFERENCES Users(PK),
+    CONSTRAINT FK_Budgets_UpdatedBy FOREIGN KEY (UpdatedByFK) REFERENCES Users(PK),
+    CONSTRAINT CK_Budgets_BudgetType CHECK (BudgetType in ('Budget', 'Forecast'))
+);
+
+-- Create INDEX within the Budgets Table
+CREATE INDEX IX_Budget_Parent 
+ON Budgets(ParentBudgetPK);
+
+-- Created Table for Monthly Budget Allocations
+CREATE TABLE BudgetMonths(
+    BudgetMonthPK INT IDENTITY(1,1) PRIMARY KEY,
+    BudgetFK INT NOT NULL,
+    YearMonth CHAR(7) NOT NULL, -- Format: YYYY-MM
+    BilledCost DECIMAL (18,2) NOT NULL,
+    EffectiveCost DECIMAL(18,2) NOT NULL,
+    CreatedByFK INT NOT NULL,
+    CreatedDate DATETIME2 NOT NULL DEFAULT SYSUTCDATETIME(),
+    UpdatedByFK INT NULL,
+    UpdatedDate DATETIME2 NULL,
+    CONSTRAINT FK_BudgetMonths_Budgets FOREIGN KEY (BudgetFK) REFERENCES Budgets(BudgetPK),
+    CONSTRAINT FK_BudgetMonths_CreatedBy FOREIGN KEY (CreatedByFK) REFERENCES Users(UserPK),
+    CONSTRAINT FK_BudgetMonths_UpdatedBy FOREIGN KEY (UpdatedByFK) REFERENCES Users(UserPK),
+    CONSTRAINT UQ_BudgetMonth UNIQUE (BudgetFK, YearMonth) -- Prevent Duplicates
+);
+
+-- Create Table for Budget Access Mapping
+CREATE TABLE BudgetGroupAccess(
+    BudgetFK INT NOT NULL,
+    GroupFK INT NOT NULL,
+    PRIMARY KEY (BudgetFK, GroupFK)
+    CONSTRAINT FK_BudgetGroupAccess_Budget FOREIGN KEY (BudgetFK) REFERENCES Budgets(BudgetPK)
+    CONSTRAINt FK_BudgetGroupAccess_Groups FOREIGN KEY (GroupFK) REFERENCES Groups(GroupPK)
+);
+
+-- Budgets History Table
+CREATE TABLE BudgetHistory(
+    HistoryID BIGINT IDENTITY(1,1) PRIMARY KEY,
+    BudgetFK INT NOT NULL,
+    UpdatedByFK INT NOT NULL,
+    UpdatedDate DATETIME2 NOT NULL DEFAULT SYSUTCDATETIME()
+    CONSTRAINT FK_BudgetHistory_Budgets FOREIGN KEY (UpdatedByFK)
+);
+
+
+CREATE FUNCTION fn_BudgetSecurityPredicate
+(@BudgetPK INT)
+RETURNS TABLE 
+WITH SCHEMABINDING 
+AS 
+RETURN
+(
+    SELECT 1 as fn_access_result
+    FROM BudgetGroupAccess bga
+    INNER JOIN UserGroupMapping ugm 
+    ON bga.GroupFK = ugm.GroupFK 
+    WHERE bga.BudgetFK = @BudgetFK AND ugm.UserFK = CAST(SESSION_CONTEXT(N'UserID') AS INT)
+);
+
+
+CREATE SECURITY POLICY BudgetSecurityPolicy
+ADD FILTER PREDICATE
+dbo.fn_BudgetSecurityPredicate(BudgetPK) 
+ON dbo.Budget 
+WITH (STATE = ON);
+
+
+
+
+
+
+
+
+
+
+-- Sample Insert Cost Center
+INSERT INTO CostCenters
+(CostCenterName, CostCenterCode) 
+VALUES ('CC100', 'Marketing'), ('CC200', 'Finance');
+
+-- Sample Insert Project
+INSERT INTO Projects
+(ProjectID, ProjectName, StartDate, EndDate)
+VALUES ('Project_2025-01', 'CMS')
+
+INSERT INTO BudgetMonths
+(
+    BudgetFK, 
+    YearMonth, 
+    BilledCost, 
+    EffectiveCost
+)
+VALUES
+    (2, '2026-03', 5.32, 203.56)
