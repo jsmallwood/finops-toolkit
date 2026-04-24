@@ -1,0 +1,92 @@
+-- Adds completion tracking to dbo.Recommendations
+IF NOT EXISTS (
+    SELECT * FROM sys.columns 
+    WHERE object_id = OBJECT_ID(N'[dbo].[Recommendations]')
+      AND name = 'CompletedDate'
+)
+BEGIN
+    ALTER TABLE [dbo].[Recommendations]
+    ADD [CompletedDate] [datetime] NULL;
+END;
+
+IF NOT EXISTS (
+    SELECT * FROM sys.columns 
+    WHERE object_id = OBJECT_ID(N'[dbo].[Recommendations]')
+      AND name = 'CompletedBy'
+)
+BEGIN
+    ALTER TABLE [dbo].[Recommendations]
+    ADD [CompletedBy] [varchar](100) NULL;
+END;
+
+IF NOT EXISTS (
+    SELECT * FROM sys.columns 
+    WHERE object_id = OBJECT_ID(N'[dbo].[Recommendations]')
+      AND name = 'ChangedId'
+)
+BEGIN
+    ALTER TABLE [dbo].[Recommendations]
+    ADD [ChangedId] [varchar](100) NULL;
+END;
+
+-- Optional, if you want quick filtering by completion state
+IF NOT EXISTS (
+    SELECT * FROM sys.indexes 
+    WHERE object_id = OBJECT_ID(N'[dbo].[Recommendations]')
+      AND name = 'IXC_Recommendations_CompletedDate'
+)
+BEGIN
+    CREATE INDEX [IXC_Recommendations_CompletedDate]
+    ON [dbo].[Recommendations]([CompletedDate]);
+END;
+GO;
+
+
+CREATE OR ALTER PROCEDURE [dbo].[GetRecommendations]
+AS
+BEGIN
+    SET NOCOUNT ON;
+
+    SELECT *
+    FROM [dbo].[Recommendations] R
+    WHERE
+        R.GeneratedDate > GETDATE()-365
+        AND R.CompletedDate IS NULL
+        AND NOT EXISTS
+        (
+            SELECT *
+            FROM [dbo].[Filters]
+            WHERE FilterType IN ('Snooze', 'Dismiss')
+              AND IsEnabled = 1
+              AND R.GeneratedDate > FilterStartDate
+              AND (FilterEndDate IS NULL OR FilterEndDate > GETDATE())
+              AND RecommendationSubTypeId = R.RecommendationSubTypeId
+              AND (InstanceId IS NULL OR R.InstanceId LIKE '%' + InstanceId + '%')
+        );
+END;
+
+
+/*
+    Schema Validation
+*/
+
+SELECT name
+FROM sys.columns
+WHERE object_id = OBJECT_ID(N'[dbo].[Recommendations]')
+  AND name IN ('CompletedDate', 'CompletedBy');
+
+/*
+    Procedure Verification
+*/
+EXEC sp_helptext 'dbo.GetRecommendations';
+
+/*
+    Functionality Sanity Test
+*/
+-- Should NOT return rows with CompletedDate populated
+SELECT TOP 10 *
+FROM dbo.GetRecommendations() -- if it were a function; for proc, run EXEC and spot check output
+
+-- OR --
+
+
