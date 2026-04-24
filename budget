@@ -1,0 +1,1118 @@
+/* ============================================================================
+   FinOps Budgets & Forecasts Database Schema (Azure SQL Database)
+   - Hierarchical Budgets/Forecasts
+   - RBAC (Users/Groups)
+   - Classifications (CostCenter, Project, Application)
+   - Versioning + Type-2 History
+   - Stored Procedures for Version Management
+   ============================================================================ */
+
+SET NOCOUNT ON;
+SET XACT_ABORT ON;
+GO
+
+/* =========================
+   1) Schemas
+   ========================= */
+IF NOT EXISTS (SELECT 1 FROM sys.schemas WHERE name = 'finops')
+    EXEC('CREATE SCHEMA finops AUTHORIZATION dbo;');
+GO
+
+IF NOT EXISTS (SELECT 1 FROM sys.schemas WHERE name = 'sec')
+    EXEC('CREATE SCHEMA sec AUTHORIZATION dbo;');
+GO
+
+/* =========================
+   2) Core Dimensions
+   ========================= */
+
+IF OBJECT_ID('DimPeriod','U') IS NULL
+BEGIN
+    CREATE TABLE DimPeriod (
+        PeriodID          INT IDENTITY(1,1) PRIMARY KEY,
+        PeriodStartDate   DATE NOT NULL,
+        PeriodEndDate     DATE NOT NULL,
+        PeriodLabel       VARCHAR(50) NOT NULL,   -- e.g. 2026-01
+        PeriodType        VARCHAR(20) NOT NULL    -- Monthly, Quarterly, Annual, Daily
+    );
+
+    CREATE INDEX IX_DimPeriod_StartEnd ON DimPeriod(PeriodStartDate, PeriodEndDate);
+    CREATE UNIQUE INDEX UX_DimPeriod_LabelType ON DimPeriod(PeriodLabel, PeriodType);
+END
+GO
+
+/* =========================
+   3) Budget Hierarchy
+   ========================= */
+
+IF OBJECT_ID('BudgetHierarchy','U') IS NULL
+BEGIN
+    CREATE TABLE BudgetHierarchy (
+        BudgetHierarchyID  INT IDENTITY(1,1) PRIMARY KEY,
+        Name               VARCHAR(100) NOT NULL,
+        Description        VARCHAR(255) NULL,
+        IsActive           BIT NOT NULL CONSTRAINT DF_BudgetHierarchy_IsActive DEFAULT 1,
+        CreatedDate        DATETIME2 NOT NULL CONSTRAINT DF_BudgetHierarchy_CreatedDate DEFAULT SYSUTCDATETIME()
+    );
+
+    CREATE UNIQUE INDEX UX_BudgetHierarchy_Name ON BudgetHierarchy(Name);
+END
+GO
+
+IF OBJECT_ID('BudgetNode','U') IS NULL
+BEGIN
+    CREATE TABLE BudgetNode (
+        BudgetNodeID          INT IDENTITY(1,1) PRIMARY KEY,
+        BudgetHierarchyID     INT NOT NULL,
+        ParentBudgetNodeID    INT NULL,
+
+        NodeType              VARCHAR(50) NOT NULL,     -- Organization, Portfolio, Application, Environment, CostCenter, Subscription, etc.
+        NodeKey               VARCHAR(200) NOT NULL,    -- stable key
+        NodeName              VARCHAR(200) NOT NULL,    -- display
+
+        EffectiveStartDate    DATE NOT NULL,
+        EffectiveEndDate      DATE NULL,
+
+        CONSTRAINT FK_BudgetNode_Hierarchy
+            FOREIGN KEY (BudgetHierarchyID)
+            REFERENCES BudgetHierarchy(BudgetHierarchyID),
+
+        CONSTRAINT FK_BudgetNode_Parent
+            FOREIGN KEY (ParentBudgetNodeID)
+            REFERENCES BudgetNode(BudgetNodeID),
+
+        CONSTRAINT CK_BudgetNode_EffectiveDates
+            CHECK (EffectiveEndDate IS NULL OR EffectiveEndDate >= EffectiveStartDate)
+    );
+
+    CREATE INDEX IX_BudgetNode_HierarchyParent ON BudgetNode(BudgetHierarchyID, ParentBudgetNodeID);
+    CREATE UNIQUE INDEX UX_BudgetNode_HierarchyKeyDates
+        ON BudgetNode(BudgetHierarchyID, NodeKey, EffectiveStartDate);
+END
+GO
+
+/* =========================
+   4) Security (Users / Groups / RBAC)
+   ========================= */
+
+IF OBJECT_ID('sec.Principal','U') IS NULL
+BEGIN
+    CREATE TABLE sec.Principal (
+        PrincipalID        INT IDENTITY(1,1) PRIMARY KEY,
+        PrincipalType      VARCHAR(20) NOT NULL,         -- User, Group
+        ExternalObjectId   UNIQUEIDENTIFIER NOT NULL,    -- Entra ID object id
+        DisplayName        NVARCHAR(200) NOT NULL,
+        Email              NVARCHAR(320) NULL,
+        IsActive           BIT NOT NULL CONSTRAINT DF_Principal_IsActive DEFAULT 1,
+        CreatedDate        DATETIME2 NOT NULL CONSTRAINT DF_Principal_CreatedDate DEFAULT SYSUTCDATETIME(),
+        CONSTRAINT CK_Principal_Type CHECK (PrincipalType IN ('User','Group'))
+    );
+
+    CREATE UNIQUE INDEX UX_Principal_ExternalObjectId ON sec.Principal(ExternalObjectId);
+    CREATE INDEX IX_Principal_Email ON sec.Principal(Email);
+END
+GO
+
+IF OBJECT_ID('sec.GroupMember','U') IS NULL
+BEGIN
+    CREATE TABLE sec.GroupMember (
+        GroupPrincipalID    INT NOT NULL,
+        UserPrincipalID     INT NOT NULL,
+        EffectiveStartDate  DATE NOT NULL CONSTRAINT DF_GroupMember_EffStart DEFAULT CONVERT(date, SYSUTCDATETIME()),
+        EffectiveEndDate    DATE NULL,
+
+        CONSTRAINT PK_GroupMember PRIMARY KEY (GroupPrincipalID, UserPrincipalID, EffectiveStartDate),
+
+        CONSTRAINT FK_GroupMember_Group FOREIGN KEY (GroupPrincipalID) REFERENCES sec.Principal(PrincipalID),
+        CONSTRAINT FK_GroupMember_User  FOREIGN KEY (UserPrincipalID)  REFERENCES sec.Principal(PrincipalID),
+
+        CONSTRAINT CK_GroupMember_EffectiveDates
+            CHECK (EffectiveEndDate IS NULL OR EffectiveEndDate >= EffectiveStartDate)
+    );
+
+    CREATE INDEX IX_GroupMember_User ON sec.GroupMember(UserPrincipalID, GroupPrincipalID);
+END
+GO
+
+IF OBJECT_ID('sec.BudgetRole','U') IS NULL
+BEGIN
+    CREATE TABLE sec.BudgetRole (
+        BudgetRoleID      INT IDENTITY(1,1) PRIMARY KEY,
+        RoleName          VARCHAR(50) NOT NULL,     -- Owner, Editor, Viewer, Approver
+        RoleDescription   VARCHAR(255) NULL,
+        IsPrivileged      BIT NOT NULL CONSTRAINT DF_BudgetRole_IsPriv DEFAULT 0
+    );
+
+    CREATE UNIQUE INDEX UX_BudgetRole_RoleName ON sec.BudgetRole(RoleName);
+END
+GO
+
+/* Seed common roles (idempotent) */
+IF NOT EXISTS (SELECT 1 FROM sec.BudgetRole WHERE RoleName = 'Owner')
+    INSERT INTO sec.BudgetRole(RoleName, RoleDescription, IsPrivileged) VALUES ('Owner','Accountable owner of the budget/forecast',1);
+IF NOT EXISTS (SELECT 1 FROM sec.BudgetRole WHERE RoleName = 'Editor')
+    INSERT INTO sec.BudgetRole(RoleName, RoleDescription, IsPrivileged) VALUES ('Editor','Can edit budget/forecast values',0);
+IF NOT EXISTS (SELECT 1 FROM sec.BudgetRole WHERE RoleName = 'Approver')
+    INSERT INTO sec.BudgetRole(RoleName, RoleDescription, IsPrivileged) VALUES ('Approver','Can approve budget values',1);
+IF NOT EXISTS (SELECT 1 FROM sec.BudgetRole WHERE RoleName = 'Viewer')
+    INSERT INTO sec.BudgetRole(RoleName, RoleDescription, IsPrivileged) VALUES ('Viewer','Read-only access',0);
+GO
+
+/* =========================
+   5) Budgets + Forecasts (Identity)
+   ========================= */
+
+IF OBJECT_ID('Budget','U') IS NULL
+BEGIN
+    CREATE TABLE Budget (
+        BudgetID         INT IDENTITY(1,1) PRIMARY KEY,
+        BudgetNodeID     INT NOT NULL,
+
+        BudgetName       VARCHAR(200) NOT NULL,
+        CurrencyCode     CHAR(3) NOT NULL,
+
+        PeriodType       VARCHAR(20) NOT NULL,      -- Monthly, Quarterly, Annual, Daily
+        IsRollup         BIT NOT NULL CONSTRAINT DF_Budget_IsRollup DEFAULT 0,
+
+        CreatedBy        NVARCHAR(100) NOT NULL,
+        CreatedDate      DATETIME2 NOT NULL CONSTRAINT DF_Budget_CreatedDate DEFAULT SYSUTCDATETIME(),
+
+        CONSTRAINT FK_Budget_Node FOREIGN KEY (BudgetNodeID) REFERENCES BudgetNode(BudgetNodeID)
+    );
+
+    CREATE INDEX IX_Budget_Node ON Budget(BudgetNodeID);
+END
+GO
+
+IF OBJECT_ID('Forecast','U') IS NULL
+BEGIN
+    CREATE TABLE Forecast (
+        ForecastID       INT IDENTITY(1,1) PRIMARY KEY,
+        BudgetID         INT NOT NULL,
+
+        ForecastType     VARCHAR(50) NOT NULL,      -- Rolling, Baseline, Scenario
+        VersionLabel     VARCHAR(50) NOT NULL,      -- human label at container level (optional)
+        CreatedBy        NVARCHAR(100) NOT NULL,
+        CreatedDate      DATETIME2 NOT NULL CONSTRAINT DF_Forecast_CreatedDate DEFAULT SYSUTCDATETIME(),
+
+        IsActive         BIT NOT NULL CONSTRAINT DF_Forecast_IsActive DEFAULT 1,
+
+        CONSTRAINT FK_Forecast_Budget FOREIGN KEY (BudgetID) REFERENCES Budget(BudgetID)
+    );
+
+    CREATE INDEX IX_Forecast_Budget ON Forecast(BudgetID);
+END
+GO
+
+/* =========================
+   6) RBAC: Budget Access (direct) + Node Access (inheritance)
+   ========================= */
+
+IF OBJECT_ID('sec.BudgetAccess','U') IS NULL
+BEGIN
+    CREATE TABLE sec.BudgetAccess (
+        BudgetAccessID     INT IDENTITY(1,1) PRIMARY KEY,
+        BudgetID           INT NOT NULL,
+        PrincipalID        INT NOT NULL,
+        BudgetRoleID       INT NOT NULL,
+
+        GrantedBy          NVARCHAR(100) NOT NULL,
+        GrantedDate        DATETIME2 NOT NULL CONSTRAINT DF_BudgetAccess_GrantedDate DEFAULT SYSUTCDATETIME(),
+
+        EffectiveStartDate DATE NOT NULL CONSTRAINT DF_BudgetAccess_EffStart DEFAULT CONVERT(date, SYSUTCDATETIME()),
+        EffectiveEndDate   DATE NULL,
+
+        CONSTRAINT FK_BudgetAccess_Budget    FOREIGN KEY (BudgetID)     REFERENCES Budget(BudgetID),
+        CONSTRAINT FK_BudgetAccess_Principal FOREIGN KEY (PrincipalID)  REFERENCES sec.Principal(PrincipalID),
+        CONSTRAINT FK_BudgetAccess_Role      FOREIGN KEY (BudgetRoleID) REFERENCES sec.BudgetRole(BudgetRoleID),
+
+        CONSTRAINT CK_BudgetAccess_EffectiveDates
+            CHECK (EffectiveEndDate IS NULL OR EffectiveEndDate >= EffectiveStartDate)
+    );
+
+    CREATE UNIQUE INDEX UX_BudgetAccess_Unique
+        ON sec.BudgetAccess(BudgetID, PrincipalID, BudgetRoleID, EffectiveStartDate);
+
+    CREATE INDEX IX_BudgetAccess_BudgetPrincipal
+        ON sec.BudgetAccess(BudgetID, PrincipalID, BudgetRoleID);
+END
+GO
+
+IF OBJECT_ID('sec.BudgetNodeAccess','U') IS NULL
+BEGIN
+    CREATE TABLE sec.BudgetNodeAccess (
+        BudgetNodeAccessID  INT IDENTITY(1,1) PRIMARY KEY,
+        BudgetNodeID        INT NOT NULL,
+        PrincipalID         INT NOT NULL,
+        BudgetRoleID        INT NOT NULL,
+
+        GrantedBy           NVARCHAR(100) NOT NULL,
+        GrantedDate         DATETIME2 NOT NULL CONSTRAINT DF_BudgetNodeAccess_GrantedDate DEFAULT SYSUTCDATETIME(),
+
+        EffectiveStartDate  DATE NOT NULL CONSTRAINT DF_BudgetNodeAccess_EffStart DEFAULT CONVERT(date, SYSUTCDATETIME()),
+        EffectiveEndDate    DATE NULL,
+
+        CONSTRAINT FK_BudgetNodeAccess_Node      FOREIGN KEY (BudgetNodeID) REFERENCES BudgetNode(BudgetNodeID),
+        CONSTRAINT FK_BudgetNodeAccess_Principal FOREIGN KEY (PrincipalID)  REFERENCES sec.Principal(PrincipalID),
+        CONSTRAINT FK_BudgetNodeAccess_Role      FOREIGN KEY (BudgetRoleID) REFERENCES sec.BudgetRole(BudgetRoleID),
+
+        CONSTRAINT CK_BudgetNodeAccess_EffectiveDates
+            CHECK (EffectiveEndDate IS NULL OR EffectiveEndDate >= EffectiveStartDate)
+    );
+
+    CREATE UNIQUE INDEX UX_BudgetNodeAccess_Unique
+        ON sec.BudgetNodeAccess(BudgetNodeID, PrincipalID, BudgetRoleID, EffectiveStartDate);
+
+    CREATE INDEX IX_BudgetNodeAccess_NodePrincipal
+        ON sec.BudgetNodeAccess(BudgetNodeID, PrincipalID, BudgetRoleID);
+END
+GO
+
+/* =========================
+   7) Classifications: CostCenter, Project, Application + association
+   ========================= */
+
+IF OBJECT_ID('CostCenter','U') IS NULL
+BEGIN
+    CREATE TABLE CostCenter (
+        CostCenterID       INT IDENTITY(1,1) PRIMARY KEY,
+        CostCenterCode     VARCHAR(50) NOT NULL,
+        CostCenterName     VARCHAR(200) NOT NULL,
+        IsActive           BIT NOT NULL CONSTRAINT DF_CostCenter_IsActive DEFAULT 1,
+        EffectiveStartDate DATE NOT NULL,
+        EffectiveEndDate   DATE NULL,
+        CONSTRAINT CK_CostCenter_EffectiveDates CHECK (EffectiveEndDate IS NULL OR EffectiveEndDate >= EffectiveStartDate)
+    );
+
+    CREATE UNIQUE INDEX UX_CostCenter_Code ON CostCenter(CostCenterCode);
+END
+GO
+
+IF OBJECT_ID('Project','U') IS NULL
+BEGIN
+    CREATE TABLE Project (
+        ProjectID          INT IDENTITY(1,1) PRIMARY KEY,
+        ProjectCode        VARCHAR(50) NOT NULL,
+        ProjectName        VARCHAR(200) NOT NULL,
+        IsActive           BIT NOT NULL CONSTRAINT DF_Project_IsActive DEFAULT 1,
+        EffectiveStartDate DATE NOT NULL,
+        EffectiveEndDate   DATE NULL,
+        CONSTRAINT CK_Project_EffectiveDates CHECK (EffectiveEndDate IS NULL OR EffectiveEndDate >= EffectiveStartDate)
+    );
+
+    CREATE UNIQUE INDEX UX_Project_Code ON Project(ProjectCode);
+END
+GO
+
+IF OBJECT_ID('Application','U') IS NULL
+BEGIN
+    CREATE TABLE Application (
+        ApplicationID      INT IDENTITY(1,1) PRIMARY KEY,
+        ApplicationName    VARCHAR(200) NOT NULL,
+        ApplicationOwner   VARCHAR(200) NULL,
+        IsActive           BIT NOT NULL CONSTRAINT DF_Application_IsActive DEFAULT 1,
+        EffectiveStartDate DATE NOT NULL,
+        EffectiveEndDate   DATE NULL,
+        CONSTRAINT CK_Application_EffectiveDates CHECK (EffectiveEndDate IS NULL OR EffectiveEndDate >= EffectiveStartDate)
+    );
+
+    CREATE UNIQUE INDEX UX_Application_Name ON Application(ApplicationName);
+END
+GO
+
+IF OBJECT_ID('ClassificationType','U') IS NULL
+BEGIN
+    CREATE TABLE ClassificationType (
+        ClassificationTypeID INT IDENTITY(1,1) PRIMARY KEY,
+        ClassificationName   VARCHAR(50) NOT NULL
+    );
+
+    CREATE UNIQUE INDEX UX_ClassificationType_Name ON ClassificationType(ClassificationName);
+END
+GO
+
+/* Seed classification types (idempotent) */
+IF NOT EXISTS (SELECT 1 FROM ClassificationType WHERE ClassificationName = 'CostCenter')
+    INSERT INTO ClassificationType(ClassificationName) VALUES ('CostCenter');
+IF NOT EXISTS (SELECT 1 FROM ClassificationType WHERE ClassificationName = 'Project')
+    INSERT INTO ClassificationType(ClassificationName) VALUES ('Project');
+IF NOT EXISTS (SELECT 1 FROM ClassificationType WHERE ClassificationName = 'Application')
+    INSERT INTO ClassificationType(ClassificationName) VALUES ('Application');
+GO
+
+IF OBJECT_ID('BudgetClassification','U') IS NULL
+BEGIN
+    CREATE TABLE BudgetClassification (
+        BudgetClassificationID INT IDENTITY(1,1) PRIMARY KEY,
+        BudgetID               INT NOT NULL,
+        ClassificationTypeID   INT NOT NULL,
+        ClassificationEntityID INT NOT NULL, -- references CostCenterID/ProjectID/ApplicationID by type
+
+        AssignedBy             NVARCHAR(100) NOT NULL,
+        AssignedDate           DATETIME2 NOT NULL CONSTRAINT DF_BudgetClassification_AssignedDate DEFAULT SYSUTCDATETIME(),
+
+        EffectiveStartDate     DATE NOT NULL,
+        EffectiveEndDate       DATE NULL,
+
+        CONSTRAINT FK_BudgetClassification_Budget FOREIGN KEY (BudgetID) REFERENCES Budget(BudgetID),
+        CONSTRAINT FK_BudgetClassification_Type  FOREIGN KEY (ClassificationTypeID) REFERENCES ClassificationType(ClassificationTypeID),
+
+        CONSTRAINT CK_BudgetClassification_EffectiveDates
+            CHECK (EffectiveEndDate IS NULL OR EffectiveEndDate >= EffectiveStartDate)
+    );
+
+    CREATE UNIQUE INDEX UX_BudgetClassification_Unique
+        ON BudgetClassification(BudgetID, ClassificationTypeID, ClassificationEntityID, EffectiveStartDate);
+
+    CREATE INDEX IX_BudgetClassification_BudgetType
+        ON BudgetClassification(BudgetID, ClassificationTypeID);
+END
+GO
+
+IF OBJECT_ID('ForecastClassification','U') IS NULL
+BEGIN
+    CREATE TABLE ForecastClassification (
+        ForecastClassificationID INT IDENTITY(1,1) PRIMARY KEY,
+        ForecastID               INT NOT NULL,
+        ClassificationTypeID     INT NOT NULL,
+        ClassificationEntityID   INT NOT NULL,
+
+        AssignedBy               NVARCHAR(100) NOT NULL,
+        AssignedDate             DATETIME2 NOT NULL CONSTRAINT DF_ForecastClassification_AssignedDate DEFAULT SYSUTCDATETIME(),
+
+        EffectiveStartDate       DATE NOT NULL,
+        EffectiveEndDate         DATE NULL,
+
+        CONSTRAINT FK_ForecastClassification_Forecast FOREIGN KEY (ForecastID) REFERENCES Forecast(ForecastID),
+        CONSTRAINT FK_ForecastClassification_Type     FOREIGN KEY (ClassificationTypeID) REFERENCES ClassificationType(ClassificationTypeID),
+
+        CONSTRAINT CK_ForecastClassification_EffectiveDates
+            CHECK (EffectiveEndDate IS NULL OR EffectiveEndDate >= EffectiveStartDate)
+    );
+
+    CREATE UNIQUE INDEX UX_ForecastClassification_Unique
+        ON ForecastClassification(ForecastID, ClassificationTypeID, ClassificationEntityID, EffectiveStartDate);
+
+    CREATE INDEX IX_ForecastClassification_ForecastType
+        ON ForecastClassification(ForecastID, ClassificationTypeID);
+END
+GO
+
+/* =========================
+   8) Versioning: BudgetVersion + BudgetAmountVersion (Type-2)
+   ========================= */
+
+IF OBJECT_ID('BudgetVersion','U') IS NULL
+BEGIN
+    CREATE TABLE BudgetVersion (
+        BudgetVersionID   INT IDENTITY(1,1) PRIMARY KEY,
+        BudgetID          INT NOT NULL,
+        VersionNumber     INT NOT NULL,
+        VersionLabel      VARCHAR(50) NOT NULL,
+        ChangeReason      VARCHAR(255) NULL,
+        IsCurrent         BIT NOT NULL CONSTRAINT DF_BudgetVersion_IsCurrent DEFAULT 0,
+        CreatedBy         NVARCHAR(100) NOT NULL,
+        CreatedDate       DATETIME2 NOT NULL CONSTRAINT DF_BudgetVersion_CreatedDate DEFAULT SYSUTCDATETIME(),
+
+        CONSTRAINT FK_BudgetVersion_Budget FOREIGN KEY (BudgetID) REFERENCES Budget(BudgetID)
+    );
+
+    CREATE UNIQUE INDEX UX_BudgetVersion_BudgetVersionNumber ON BudgetVersion(BudgetID, VersionNumber);
+    CREATE INDEX IX_BudgetVersion_Current ON BudgetVersion(BudgetID, IsCurrent) INCLUDE (BudgetVersionID, VersionNumber, VersionLabel);
+END
+GO
+
+IF OBJECT_ID('BudgetAmountVersion','U') IS NULL
+BEGIN
+    CREATE TABLE BudgetAmountVersion (
+        BudgetAmountVersionID  INT IDENTITY(1,1) PRIMARY KEY,
+        BudgetVersionID        INT NOT NULL,
+        PeriodID               INT NOT NULL,
+
+        /* Envisor-aligned amount fields: billed and/or effective (amortized). */
+        BilledCost             DECIMAL(18,4) NULL,
+        EffectiveCost          DECIMAL(18,4) NULL,
+
+        IsApproved             BIT NOT NULL CONSTRAINT DF_BudgetAmountVersion_IsApproved DEFAULT 0,
+        ApprovedByPrincipalID  INT NULL,
+        ApprovedDate           DATETIME2 NULL,
+
+        EffectiveFromDate      DATETIME2 NOT NULL CONSTRAINT DF_BudgetAmountVersion_EffFrom DEFAULT SYSUTCDATETIME(),
+        EffectiveToDate        DATETIME2 NULL,
+
+        CONSTRAINT FK_BudgetAmountVersion_Version FOREIGN KEY (BudgetVersionID) REFERENCES BudgetVersion(BudgetVersionID),
+        CONSTRAINT FK_BudgetAmountVersion_Period  FOREIGN KEY (PeriodID)        REFERENCES DimPeriod(PeriodID),
+        CONSTRAINT FK_BudgetAmountVersion_ApprovedBy FOREIGN KEY (ApprovedByPrincipalID) REFERENCES sec.Principal(PrincipalID),
+
+        CONSTRAINT CK_BudgetAmountVersion_Costs CHECK (
+            (BilledCost IS NOT NULL OR EffectiveCost IS NOT NULL)
+        )
+    );
+
+    CREATE INDEX IX_BudgetAmountVersion_VersionPeriod ON BudgetAmountVersion(BudgetVersionID, PeriodID, EffectiveToDate);
+END
+GO
+
+/* Filtered index for current-effective rows */
+IF NOT EXISTS (
+    SELECT 1 FROM sys.indexes
+    WHERE name = 'IX_BudgetAmountVersion_Current' AND object_id = OBJECT_ID('BudgetAmountVersion')
+)
+BEGIN
+    CREATE INDEX IX_BudgetAmountVersion_Current
+    ON BudgetAmountVersion(BudgetVersionID, PeriodID)
+    INCLUDE (BilledCost, EffectiveCost, EffectiveFromDate, IsApproved, ApprovedDate)
+    WHERE EffectiveToDate IS NULL;
+END
+GO
+
+/* =========================
+   9) Versioning: ForecastVersion + ForecastAmountVersion (Type-2)
+   ========================= */
+
+IF OBJECT_ID('ForecastVersion','U') IS NULL
+BEGIN
+    CREATE TABLE ForecastVersion (
+        ForecastVersionID INT IDENTITY(1,1) PRIMARY KEY,
+        ForecastID        INT NOT NULL,
+        VersionNumber     INT NOT NULL,
+        VersionLabel      VARCHAR(50) NOT NULL,
+        ForecastMethod    VARCHAR(100) NULL,
+        ChangeReason      VARCHAR(255) NULL,
+        IsCurrent         BIT NOT NULL CONSTRAINT DF_ForecastVersion_IsCurrent DEFAULT 0,
+        CreatedBy         NVARCHAR(100) NOT NULL,
+        CreatedDate       DATETIME2 NOT NULL CONSTRAINT DF_ForecastVersion_CreatedDate DEFAULT SYSUTCDATETIME(),
+
+        CONSTRAINT FK_ForecastVersion_Forecast FOREIGN KEY (ForecastID) REFERENCES Forecast(ForecastID)
+    );
+
+    CREATE UNIQUE INDEX UX_ForecastVersion_ForecastVersionNumber ON ForecastVersion(ForecastID, VersionNumber);
+    CREATE INDEX IX_ForecastVersion_Current ON ForecastVersion(ForecastID, IsCurrent) INCLUDE (ForecastVersionID, VersionNumber, VersionLabel);
+END
+GO
+
+IF OBJECT_ID('ForecastAmountVersion','U') IS NULL
+BEGIN
+    CREATE TABLE ForecastAmountVersion (
+        ForecastAmountVersionID INT IDENTITY(1,1) PRIMARY KEY,
+        ForecastVersionID       INT NOT NULL,
+        PeriodID                INT NOT NULL,
+
+        /* Envisor-aligned amount fields: billed and/or effective (amortized). */
+        BilledCost              DECIMAL(18,4) NULL,
+        EffectiveCost           DECIMAL(18,4) NULL,
+
+        EffectiveFromDate       DATETIME2 NOT NULL CONSTRAINT DF_ForecastAmountVersion_EffFrom DEFAULT SYSUTCDATETIME(),
+        EffectiveToDate         DATETIME2 NULL,
+
+        CONSTRAINT FK_ForecastAmountVersion_Version FOREIGN KEY (ForecastVersionID) REFERENCES ForecastVersion(ForecastVersionID),
+        CONSTRAINT FK_ForecastAmountVersion_Period  FOREIGN KEY (PeriodID)          REFERENCES DimPeriod(PeriodID),
+
+        CONSTRAINT CK_ForecastAmountVersion_Costs CHECK (
+            (BilledCost IS NOT NULL OR EffectiveCost IS NOT NULL)
+        )
+    );
+
+    CREATE INDEX IX_ForecastAmountVersion_VersionPeriod ON ForecastAmountVersion(ForecastVersionID, PeriodID, EffectiveToDate);
+END
+GO
+
+IF NOT EXISTS (
+    SELECT 1 FROM sys.indexes
+    WHERE name = 'IX_ForecastAmountVersion_Current' AND object_id = OBJECT_ID('ForecastAmountVersion')
+)
+BEGIN
+    CREATE INDEX IX_ForecastAmountVersion_Current
+    ON ForecastAmountVersion(ForecastVersionID, PeriodID)
+    INCLUDE (BilledCost, EffectiveCost, EffectiveFromDate)
+    WHERE EffectiveToDate IS NULL;
+END
+GO
+
+/* =========================
+   10) Views (Effective access + convenience)
+   ========================= */
+
+CREATE OR ALTER VIEW sec.vUserBudgetEffectiveAccess
+AS
+WITH NodeAncestors AS (
+    SELECT
+        bn.BudgetNodeID AS DescendantNodeID,
+        bn.BudgetNodeID AS AncestorNodeID
+    FROM BudgetNode bn
+
+    UNION ALL
+
+    SELECT
+        na.DescendantNodeID,
+        bn.ParentBudgetNodeID
+    FROM NodeAncestors na
+    JOIN BudgetNode bn
+        ON bn.BudgetNodeID = na.AncestorNodeID
+    WHERE bn.ParentBudgetNodeID IS NOT NULL
+)
+SELECT
+    b.BudgetID,
+    b.BudgetNodeID,
+    ba.PrincipalID,
+    p.DisplayName,
+    r.RoleName,
+    'DirectBudget' AS AccessSource
+FROM Budget b
+JOIN sec.BudgetAccess ba ON ba.BudgetID = b.BudgetID
+JOIN sec.Principal p     ON p.PrincipalID = ba.PrincipalID
+JOIN sec.BudgetRole r    ON r.BudgetRoleID = ba.BudgetRoleID
+WHERE ba.EffectiveEndDate IS NULL OR ba.EffectiveEndDate >= CONVERT(date, SYSUTCDATETIME())
+
+UNION ALL
+
+SELECT
+    b.BudgetID,
+    b.BudgetNodeID,
+    bna.PrincipalID,
+    p.DisplayName,
+    r.RoleName,
+    'InheritedFromNode' AS AccessSource
+FROM Budget b
+JOIN NodeAncestors na          ON na.DescendantNodeID = b.BudgetNodeID
+JOIN sec.BudgetNodeAccess bna  ON bna.BudgetNodeID = na.AncestorNodeID
+JOIN sec.Principal p           ON p.PrincipalID = bna.PrincipalID
+JOIN sec.BudgetRole r          ON r.BudgetRoleID = bna.BudgetRoleID
+WHERE bna.EffectiveEndDate IS NULL OR bna.EffectiveEndDate >= CONVERT(date, SYSUTCDATETIME());
+GO
+
+CREATE OR ALTER VIEW vCurrentBudgetAmounts
+AS
+SELECT
+    b.BudgetID,
+    bv.BudgetVersionID,
+    bv.VersionNumber,
+    bv.VersionLabel,
+    dp.PeriodID,
+    dp.PeriodLabel,
+    bav.BilledCost,
+    bav.EffectiveCost,
+    bav.IsApproved,
+    bav.ApprovedDate
+FROM Budget b
+JOIN BudgetVersion bv
+    ON bv.BudgetID = b.BudgetID AND bv.IsCurrent = 1
+JOIN BudgetAmountVersion bav
+    ON bav.BudgetVersionID = bv.BudgetVersionID
+JOIN DimPeriod dp
+    ON dp.PeriodID = bav.PeriodID
+WHERE bav.EffectiveToDate IS NULL;
+GO
+
+CREATE OR ALTER VIEW vCurrentForecastAmounts
+AS
+SELECT
+    f.ForecastID,
+    fv.ForecastVersionID,
+    fv.VersionNumber,
+    fv.VersionLabel,
+    dp.PeriodID,
+    dp.PeriodLabel,
+    fav.BilledCost,
+    fav.EffectiveCost
+FROM Forecast f
+JOIN ForecastVersion fv
+    ON fv.ForecastID = f.ForecastID AND fv.IsCurrent = 1
+JOIN ForecastAmountVersion fav
+    ON fav.ForecastVersionID = fv.ForecastVersionID
+JOIN DimPeriod dp
+    ON dp.PeriodID = fav.PeriodID
+WHERE fav.EffectiveToDate IS NULL;
+GO
+
+/* =========================
+   11) TVPs for batch upserts
+   ========================= */
+
+IF TYPE_ID('BudgetAmountTvp') IS NULL
+    EXEC('CREATE TYPE BudgetAmountTvp AS TABLE (PeriodID INT NOT NULL, BilledCost DECIMAL(18,4) NULL, EffectiveCost DECIMAL(18,4) NULL);');
+GO
+
+IF TYPE_ID('ForecastAmountTvp') IS NULL
+    EXEC('CREATE TYPE ForecastAmountTvp AS TABLE (PeriodID INT NOT NULL, BilledCost DECIMAL(18,4) NULL, EffectiveCost DECIMAL(18,4) NULL);');
+GO
+
+/* =========================
+   12) Stored Procedures: Version Management (Budgets)
+   ========================= */
+
+CREATE OR ALTER PROCEDURE usp_BudgetVersion_SetCurrent
+(
+    @BudgetVersionID INT,
+    @ChangedBy       NVARCHAR(100)
+)
+AS
+BEGIN
+    SET NOCOUNT ON;
+    SET XACT_ABORT ON;
+
+    DECLARE @BudgetID INT;
+
+    SELECT @BudgetID = BudgetID
+    FROM BudgetVersion
+    WHERE BudgetVersionID = @BudgetVersionID;
+
+    IF (@BudgetID IS NULL)
+        THROW 50001, 'Invalid BudgetVersionID.', 1;
+
+    BEGIN TRAN;
+
+    UPDATE BudgetVersion
+    SET IsCurrent = 0
+    WHERE BudgetID = @BudgetID
+      AND IsCurrent = 1;
+
+    UPDATE BudgetVersion
+    SET IsCurrent = 1
+    WHERE BudgetVersionID = @BudgetVersionID;
+
+    COMMIT TRAN;
+END
+GO
+
+CREATE OR ALTER PROCEDURE usp_BudgetVersion_Create
+(
+    @BudgetID            INT,
+    @VersionLabel        VARCHAR(50),
+    @ChangeReason        VARCHAR(255) = NULL,
+    @CreatedBy           NVARCHAR(100),
+    @CloneFromCurrent    BIT = 1,
+    @SetAsCurrent        BIT = 1,
+    @NewBudgetVersionID  INT OUTPUT
+)
+AS
+BEGIN
+    SET NOCOUNT ON;
+    SET XACT_ABORT ON;
+
+    BEGIN TRAN;
+
+    DECLARE @NextVersionNumber INT;
+
+    SELECT @NextVersionNumber = ISNULL(MAX(VersionNumber), 0) + 1
+    FROM BudgetVersion WITH (UPDLOCK, HOLDLOCK)
+    WHERE BudgetID = @BudgetID;
+
+    INSERT INTO BudgetVersion
+    (
+        BudgetID, VersionNumber, VersionLabel, ChangeReason, IsCurrent, CreatedBy, CreatedDate
+    )
+    VALUES
+    (
+        @BudgetID, @NextVersionNumber, @VersionLabel, @ChangeReason, 0, @CreatedBy, SYSUTCDATETIME()
+    );
+
+    SET @NewBudgetVersionID = SCOPE_IDENTITY();
+
+    IF (@CloneFromCurrent = 1)
+    BEGIN
+        DECLARE @CurrentBudgetVersionID INT;
+
+        SELECT @CurrentBudgetVersionID = BudgetVersionID
+        FROM BudgetVersion
+        WHERE BudgetID = @BudgetID AND IsCurrent = 1;
+
+        IF (@CurrentBudgetVersionID IS NOT NULL)
+        BEGIN
+            INSERT INTO BudgetAmountVersion
+            (
+                BudgetVersionID, PeriodID, BilledCost, EffectiveCost,
+                IsApproved, ApprovedByPrincipalID, ApprovedDate,
+                EffectiveFromDate, EffectiveToDate
+            )
+            SELECT
+                @NewBudgetVersionID,
+                bav.PeriodID,
+                bav.BilledCost,
+                bav.EffectiveCost,
+                0, NULL, NULL,
+                SYSUTCDATETIME(),
+                NULL
+            FROM BudgetAmountVersion bav
+            WHERE bav.BudgetVersionID = @CurrentBudgetVersionID
+              AND bav.EffectiveToDate IS NULL;
+        END
+    END
+
+    IF (@SetAsCurrent = 1)
+    BEGIN
+        EXEC usp_BudgetVersion_SetCurrent
+            @BudgetVersionID = @NewBudgetVersionID,
+            @ChangedBy = @CreatedBy;
+    END
+
+    COMMIT TRAN;
+END
+GO
+
+CREATE OR ALTER PROCEDURE usp_BudgetAmount_UpsertCurrent
+(
+    @BudgetID     INT,
+    @Amounts      BudgetAmountTvp READONLY,
+    @ChangedBy    NVARCHAR(100)
+)
+AS
+BEGIN
+    SET NOCOUNT ON;
+    SET XACT_ABORT ON;
+
+    DECLARE @BudgetVersionID INT = NULL;
+    DECLARE @Now DATETIME2 = SYSUTCDATETIME();
+
+    SELECT @BudgetVersionID = BudgetVersionID
+    FROM BudgetVersion
+    WHERE BudgetID = @BudgetID AND IsCurrent = 1;
+
+    IF (@BudgetVersionID IS NULL)
+        THROW 50002, 'No current BudgetVersion exists for this BudgetID.', 1;
+
+    BEGIN TRAN;
+
+    /* Close changed rows */
+    UPDATE bav
+    SET EffectiveToDate = @Now
+    FROM BudgetAmountVersion bav
+    JOIN @Amounts a
+      ON a.PeriodID = bav.PeriodID
+    WHERE bav.BudgetVersionID = @BudgetVersionID
+      AND bav.EffectiveToDate IS NULL
+      AND (
+            ISNULL(bav.BilledCost, -999999999.9999) <> ISNULL(a.BilledCost, -999999999.9999)
+         OR ISNULL(bav.EffectiveCost, -999999999.9999) <> ISNULL(a.EffectiveCost, -999999999.9999)
+      );
+
+    /* Insert new rows where missing or changed */
+    INSERT INTO BudgetAmountVersion
+    (
+        BudgetVersionID, PeriodID, BilledCost, EffectiveCost,
+        IsApproved, ApprovedByPrincipalID, ApprovedDate,
+        EffectiveFromDate, EffectiveToDate
+    )
+    SELECT
+        @BudgetVersionID,
+        a.PeriodID,
+        a.BilledCost,
+        a.EffectiveCost,
+        0, NULL, NULL,
+        @Now,
+        NULL
+    FROM @Amounts a
+    LEFT JOIN BudgetAmountVersion bav
+      ON bav.BudgetVersionID = @BudgetVersionID
+     AND bav.PeriodID = a.PeriodID
+     AND bav.EffectiveToDate IS NULL
+    WHERE bav.BudgetAmountVersionID IS NULL
+       OR (
+            ISNULL(bav.BilledCost, -999999999.9999) <> ISNULL(a.BilledCost, -999999999.9999)
+         OR ISNULL(bav.EffectiveCost, -999999999.9999) <> ISNULL(a.EffectiveCost, -999999999.9999)
+       );
+
+    COMMIT TRAN;
+END
+GO
+
+CREATE OR ALTER PROCEDURE usp_BudgetAmount_Approve
+(
+    @BudgetVersionID       INT,
+    @ApproverPrincipalID   INT,
+    @PeriodStartID         INT = NULL,
+    @PeriodEndID           INT = NULL
+)
+AS
+BEGIN
+    SET NOCOUNT ON;
+    SET XACT_ABORT ON;
+
+    DECLARE @Now DATETIME2 = SYSUTCDATETIME();
+
+    BEGIN TRAN;
+
+    UPDATE bav
+    SET IsApproved = 1,
+        ApprovedByPrincipalID = @ApproverPrincipalID,
+        ApprovedDate = @Now
+    FROM BudgetAmountVersion bav
+    WHERE bav.BudgetVersionID = @BudgetVersionID
+      AND bav.EffectiveToDate IS NULL
+      AND (@PeriodStartID IS NULL OR bav.PeriodID >= @PeriodStartID)
+      AND (@PeriodEndID   IS NULL OR bav.PeriodID <= @PeriodEndID);
+
+    COMMIT TRAN;
+END
+GO
+
+CREATE OR ALTER PROCEDURE usp_Budget_GetAmounts_AsOf
+(
+    @BudgetID   INT,
+    @AsOf       DATETIME2
+)
+AS
+BEGIN
+    SET NOCOUNT ON;
+
+    SELECT
+        bv.BudgetVersionID,
+        bv.VersionNumber,
+        bv.VersionLabel,
+        dp.PeriodID,
+        dp.PeriodLabel,
+        bav.BilledCost,
+        bav.EffectiveCost,
+        bav.IsApproved,
+        bav.ApprovedDate,
+        bav.EffectiveFromDate,
+        bav.EffectiveToDate
+    FROM BudgetVersion bv
+    JOIN BudgetAmountVersion bav
+      ON bav.BudgetVersionID = bv.BudgetVersionID
+    JOIN DimPeriod dp
+      ON dp.PeriodID = bav.PeriodID
+    WHERE bv.BudgetID = @BudgetID
+      AND @AsOf >= bav.EffectiveFromDate
+      AND @AsOf <  ISNULL(bav.EffectiveToDate, '9999-12-31');
+END
+GO
+
+/* =========================
+   13) Stored Procedures: Version Management (Forecasts)
+   ========================= */
+
+CREATE OR ALTER PROCEDURE usp_ForecastVersion_SetCurrent
+(
+    @ForecastVersionID INT,
+    @ChangedBy         NVARCHAR(100)
+)
+AS
+BEGIN
+    SET NOCOUNT ON;
+    SET XACT_ABORT ON;
+
+    DECLARE @ForecastID INT;
+
+    SELECT @ForecastID = ForecastID
+    FROM ForecastVersion
+    WHERE ForecastVersionID = @ForecastVersionID;
+
+    IF (@ForecastID IS NULL)
+        THROW 50003, 'Invalid ForecastVersionID.', 1;
+
+    BEGIN TRAN;
+
+    UPDATE ForecastVersion
+    SET IsCurrent = 0
+    WHERE ForecastID = @ForecastID
+      AND IsCurrent = 1;
+
+    UPDATE ForecastVersion
+    SET IsCurrent = 1
+    WHERE ForecastVersionID = @ForecastVersionID;
+
+    COMMIT TRAN;
+END
+GO
+
+CREATE OR ALTER PROCEDURE usp_ForecastVersion_Create
+(
+    @ForecastID            INT,
+    @VersionLabel          VARCHAR(50),
+    @ForecastMethod        VARCHAR(100) = NULL,
+    @ChangeReason          VARCHAR(255) = NULL,
+    @CreatedBy             NVARCHAR(100),
+    @CloneFromCurrent      BIT = 1,
+    @SetAsCurrent          BIT = 1,
+    @NewForecastVersionID  INT OUTPUT
+)
+AS
+BEGIN
+    SET NOCOUNT ON;
+    SET XACT_ABORT ON;
+
+    BEGIN TRAN;
+
+    DECLARE @NextVersionNumber INT;
+
+    SELECT @NextVersionNumber = ISNULL(MAX(VersionNumber), 0) + 1
+    FROM ForecastVersion WITH (UPDLOCK, HOLDLOCK)
+    WHERE ForecastID = @ForecastID;
+
+    INSERT INTO ForecastVersion
+    (
+        ForecastID, VersionNumber, VersionLabel, ForecastMethod, ChangeReason,
+        IsCurrent, CreatedBy, CreatedDate
+    )
+    VALUES
+    (
+        @ForecastID, @NextVersionNumber, @VersionLabel, @ForecastMethod, @ChangeReason,
+        0, @CreatedBy, SYSUTCDATETIME()
+    );
+
+    SET @NewForecastVersionID = SCOPE_IDENTITY();
+
+    IF (@CloneFromCurrent = 1)
+    BEGIN
+        DECLARE @CurrentForecastVersionID INT;
+
+        SELECT @CurrentForecastVersionID = ForecastVersionID
+        FROM ForecastVersion
+        WHERE ForecastID = @ForecastID AND IsCurrent = 1;
+
+        IF (@CurrentForecastVersionID IS NOT NULL)
+        BEGIN
+            INSERT INTO ForecastAmountVersion
+            (
+                ForecastVersionID, PeriodID, BilledCost, EffectiveCost,
+                EffectiveFromDate, EffectiveToDate
+            )
+            SELECT
+                @NewForecastVersionID,
+                fav.PeriodID,
+                fav.BilledCost,
+                fav.EffectiveCost,
+                SYSUTCDATETIME(),
+                NULL
+            FROM ForecastAmountVersion fav
+            WHERE fav.ForecastVersionID = @CurrentForecastVersionID
+              AND fav.EffectiveToDate IS NULL;
+        END
+    END
+
+    IF (@SetAsCurrent = 1)
+    BEGIN
+        EXEC usp_ForecastVersion_SetCurrent
+            @ForecastVersionID = @NewForecastVersionID,
+            @ChangedBy = @CreatedBy;
+    END
+
+    COMMIT TRAN;
+END
+GO
+
+CREATE OR ALTER PROCEDURE usp_ForecastAmount_UpsertCurrent
+(
+    @ForecastID   INT,
+    @Amounts      ForecastAmountTvp READONLY,
+    @ChangedBy    NVARCHAR(100)
+)
+AS
+BEGIN
+    SET NOCOUNT ON;
+    SET XACT_ABORT ON;
+
+    DECLARE @ForecastVersionID INT = NULL;
+    DECLARE @Now DATETIME2 = SYSUTCDATETIME();
+
+    SELECT @ForecastVersionID = ForecastVersionID
+    FROM ForecastVersion
+    WHERE ForecastID = @ForecastID AND IsCurrent = 1;
+
+    IF (@ForecastVersionID IS NULL)
+        THROW 50004, 'No current ForecastVersion exists for this ForecastID.', 1;
+
+    BEGIN TRAN;
+
+    UPDATE fav
+    SET EffectiveToDate = @Now
+    FROM ForecastAmountVersion fav
+    JOIN @Amounts a
+      ON a.PeriodID = fav.PeriodID
+    WHERE fav.ForecastVersionID = @ForecastVersionID
+      AND fav.EffectiveToDate IS NULL
+      AND (
+            ISNULL(fav.BilledCost, -999999999.9999) <> ISNULL(a.BilledCost, -999999999.9999)
+         OR ISNULL(fav.EffectiveCost, -999999999.9999) <> ISNULL(a.EffectiveCost, -999999999.9999)
+      );
+
+    INSERT INTO ForecastAmountVersion
+    (
+        ForecastVersionID, PeriodID, BilledCost, EffectiveCost,
+        EffectiveFromDate, EffectiveToDate
+    )
+    SELECT
+        @ForecastVersionID,
+        a.PeriodID,
+        a.BilledCost,
+        a.EffectiveCost,
+        @Now,
+        NULL
+    FROM @Amounts a
+    LEFT JOIN ForecastAmountVersion fav
+      ON fav.ForecastVersionID = @ForecastVersionID
+     AND fav.PeriodID = a.PeriodID
+     AND fav.EffectiveToDate IS NULL
+    WHERE fav.ForecastAmountVersionID IS NULL
+       OR (
+            ISNULL(fav.BilledCost, -999999999.9999) <> ISNULL(a.BilledCost, -999999999.9999)
+         OR ISNULL(fav.EffectiveCost, -999999999.9999) <> ISNULL(a.EffectiveCost, -999999999.9999)
+       );
+
+    COMMIT TRAN;
+END
+GO
+
+CREATE OR ALTER PROCEDURE usp_Forecast_GetAmounts_AsOf
+(
+    @ForecastID INT,
+    @AsOf       DATETIME2
+)
+AS
+BEGIN
+    SET NOCOUNT ON;
+
+    SELECT
+        fv.ForecastVersionID,
+        fv.VersionNumber,
+        fv.VersionLabel,
+        dp.PeriodID,
+        dp.PeriodLabel,
+        fav.BilledCost,
+        fav.EffectiveCost,
+        fav.EffectiveFromDate,
+        fav.EffectiveToDate
+    FROM ForecastVersion fv
+    JOIN ForecastAmountVersion fav
+      ON fav.ForecastVersionID = fv.ForecastVersionID
+    JOIN DimPeriod dp
+      ON dp.PeriodID = fav.PeriodID
+    WHERE fv.ForecastID = @ForecastID
+      AND @AsOf >= fav.EffectiveFromDate
+      AND @AsOf <  ISNULL(fav.EffectiveToDate, '9999-12-31');
+END
+GO
+
+/* =========================
+   14) Helpful integrity check: ensure only one current version per Budget/Forecast
+   (Unique filtered indexes)
+   ========================= */
+
+IF NOT EXISTS (
+    SELECT 1 FROM sys.indexes
+    WHERE name = 'UX_BudgetVersion_OneCurrent' AND object_id = OBJECT_ID('BudgetVersion')
+)
+BEGIN
+    CREATE UNIQUE INDEX UX_BudgetVersion_OneCurrent
+    ON BudgetVersion(BudgetID)
+    WHERE IsCurrent = 1;
+END
+GO
+
+IF NOT EXISTS (
+    SELECT 1 FROM sys.indexes
+    WHERE name = 'UX_ForecastVersion_OneCurrent' AND object_id = OBJECT_ID('ForecastVersion')
+)
+BEGIN
+    CREATE UNIQUE INDEX UX_ForecastVersion_OneCurrent
+    ON ForecastVersion(ForecastID)
+    WHERE IsCurrent = 1;
+END
+GO
+
+/* =========================
+   END
+   ========================= */
+PRINT 'FinOps budgets & forecasts schema created/verified successfully.';
+GO
